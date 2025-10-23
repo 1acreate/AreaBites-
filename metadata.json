@@ -1,0 +1,5 @@
+{
+  "name": "Copy of AreaBites",
+  "description": "A Zomato-like food ordering application where administrators can add food items with images and videos, and customers can browse, order food, and place orders. The application includes a notification system for new orders.",
+  "requestFramePermissions": []
+}
