@@ -1,78 +1,181 @@
 
-import React, { useState, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import { FoodItem, CartItem, Order, CustomerDetails, PaymentMethod, OrderStatus } from './types';
-
-type View = 'customer' | 'cart' | 'checkout' | 'admin' | 'myOrders';
+import { supabase } from './supabaseClient';
 
 // Context for managing application state
 const AppContext = React.createContext<{
+  loading: boolean;
   foodItems: FoodItem[];
   cart: CartItem[];
   orders: Order[];
   notifications: Order[];
-  addFoodItem: (item: Omit<FoodItem, 'id'>) => void;
+  addFoodItem: (item: any) => Promise<void>;
   addToCart: (item: FoodItem) => void;
   updateCartQuantity: (itemId: string, quantity: number) => void;
   removeFromCart: (itemId: string) => void;
   clearCart: () => void;
   placeOrder: (customer: CustomerDetails, paymentMethod: PaymentMethod) => void;
+  updateOrderStatus: (orderId: string, status: OrderStatus) => Promise<void>;
   clearNotifications: () => void;
-  updateOrderStatus: (orderId: string, status: OrderStatus, deliveryTime?: string) => void;
 }>({
+  loading: true,
   foodItems: [],
   cart: [],
   orders: [],
   notifications: [],
-  addFoodItem: () => {},
+  addFoodItem: async () => {},
   addToCart: () => {},
   updateCartQuantity: () => {},
   removeFromCart: () => {},
   clearCart: () => {},
   placeOrder: () => {},
+  updateOrderStatus: async () => {},
   clearNotifications: () => {},
-  updateOrderStatus: () => {},
 });
+
+// Helper function to map Supabase food item row to frontend type
+const mapFoodItemFromDb = (item: any): FoodItem => ({
+  id: item.id,
+  name: item.name,
+  description: item.description,
+  size: item.size,
+  price: item.price,
+  image1Url: item.image1_url,
+  image2Url: item.image2_url,
+  videoUrl: item.video_url,
+});
+
+// Helper function to map Supabase order row to frontend type
+const mapOrderFromDb = (order: any): Order => ({
+  id: order.id,
+  customer: order.customer_details,
+  items: order.items,
+  total: order.total,
+  paymentMethod: order.payment_method,
+  timestamp: order.created_at,
+  status: order.status,
+  status_updated_at: order.status_updated_at,
+});
+
 
 // App Provider Component
 const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [foodItems, setFoodItems] = useState<FoodItem[]>([
-    {
-      id: '1',
-      name: 'Margherita Pizza',
-      description: 'Classic delight with 100% real mozzarella cheese',
-      size: 'Medium',
-      price: 299,
-      image1Url: 'https://picsum.photos/seed/pizza1/600/400',
-      image2Url: 'https://picsum.photos/seed/pizza2/600/400',
-      videoUrl: '', // No default video
-    },
-    {
-      id: '2',
-      name: 'Veggie Burger',
-      description: 'A delicious burger with a crispy veg patty, fresh lettuce, and our special sauce.',
-      size: 'Regular',
-      price: 149,
-      image1Url: 'https://picsum.photos/seed/burger1/600/400',
-      image2Url: 'https://picsum.photos/seed/burger2/600/400',
-      videoUrl: '',
-    },
-    {
-      id: '3',
-      name: 'Pasta Alfredo',
-      description: 'Creamy white sauce pasta with exotic veggies.',
-      size: 'Full Plate',
-      price: 349,
-      image1Url: 'https://picsum.photos/seed/pasta1/600/400',
-      image2Url: 'https://picsum.photos/seed/pasta2/600/400',
-      videoUrl: '',
-    }
-  ]);
+  const [loading, setLoading] = useState(true);
+  const [foodItems, setFoodItems] = useState<FoodItem[]>([]);
   const [cart, setCart] = useState<CartItem[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [notifications, setNotifications] = useState<Order[]>([]);
 
-  const addFoodItem = useCallback((item: Omit<FoodItem, 'id'>) => {
-    setFoodItems(prev => [...prev, { ...item, id: Date.now().toString() }]);
+  const fetchFoodItems = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from('food_items').select('*').order('created_at', { ascending: false });
+    if (error) {
+      console.error('Error fetching food items:', error.message);
+    } else {
+      setFoodItems(data.map(mapFoodItemFromDb));
+    }
+  }, []);
+
+  const fetchOrders = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from('orders').select('*').order('created_at', { ascending: false });
+    if (error) {
+      console.error('Error fetching orders:', error.message);
+    } else {
+      setOrders(data.map(mapOrderFromDb));
+    }
+  }, []);
+
+
+  useEffect(() => {
+    if (!supabase) {
+        setLoading(false);
+        return;
+    };
+
+    const fetchAllData = async () => {
+        setLoading(true);
+        await Promise.all([fetchFoodItems(), fetchOrders()]);
+        setLoading(false);
+    }
+    fetchAllData();
+
+    const channel = supabase.channel('custom-all-channel')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'orders' },
+        (payload) => {
+           if (payload.eventType === 'INSERT') {
+            console.log('New order received!', payload);
+            const newOrder = mapOrderFromDb(payload.new);
+            setOrders(prev => [newOrder, ...prev]);
+            setNotifications(prev => [newOrder, ...prev]);
+           } else if (payload.eventType === 'UPDATE') {
+             console.log('Order updated!', payload);
+             const updatedOrder = mapOrderFromDb(payload.new);
+             setOrders(prev => prev.map(o => o.id === updatedOrder.id ? updatedOrder : o));
+           }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'food_items' },
+        (payload) => {
+            console.log('New food item from another client!', payload);
+            const newItem = mapFoodItemFromDb(payload.new);
+            setFoodItems(prev => {
+              if (prev.some(item => item.id === newItem.id)) {
+                return prev;
+              }
+              return [newItem, ...prev];
+            });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchFoodItems, fetchOrders]);
+  
+
+  const addFoodItem = useCallback(async (item: any) => {
+      if (!supabase) return;
+      const uploadFile = async (file: File) => {
+        if (!file) return null;
+        const fileName = `${Date.now()}_${file.name}`;
+        const { data, error } = await supabase.storage.from('food-media').upload(fileName, file);
+        if (error) throw error;
+        const { data: { publicUrl } } = supabase.storage.from('food-media').getPublicUrl(fileName);
+        return publicUrl;
+      }
+      
+      const [image1Url, image2Url, videoUrl] = await Promise.all([
+        uploadFile(item.image1File),
+        uploadFile(item.image2File),
+        uploadFile(item.videoFile),
+      ]);
+      
+      const { data: insertedData, error } = await supabase.from('food_items').insert({
+        name: item.name,
+        description: item.description,
+        size: item.size,
+        price: item.price,
+        image1_url: image1Url,
+        image2_url: image2Url,
+        video_url: videoUrl,
+      }).select().single();
+
+      if (error) {
+        console.error("Error adding food item", error.message);
+        throw error;
+      }
+      
+      if (insertedData) {
+        const newItem = mapFoodItemFromDb(insertedData);
+        setFoodItems(prev => [newItem, ...prev]);
+      }
   }, []);
 
   const addToCart = useCallback((item: FoodItem) => {
@@ -104,38 +207,45 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     setCart([]);
   }, []);
 
-  const placeOrder = useCallback((customer: CustomerDetails, paymentMethod: PaymentMethod) => {
+  const placeOrder = useCallback(async (customer: CustomerDetails, paymentMethod: PaymentMethod) => {
+    if (!supabase) return;
     const total = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
-    const newOrder: Order = {
-      id: `order-${Date.now()}`,
-      customer,
-      items: [...cart],
-      total,
-      paymentMethod,
-      timestamp: new Date(),
-      status: 'Pending',
-    };
-    setOrders(prev => [newOrder, ...prev]);
-    setNotifications(prev => [newOrder, ...prev]);
-    setCart([]);
+    const { error } = await supabase.from('orders').insert({
+        customer_details: customer,
+        items: cart,
+        total,
+        payment_method: paymentMethod,
+        status: 'Pending', // Default status
+    });
+
+    if (error) {
+      console.error("Error placing order:", error.message);
+      alert(`Failed to place order: ${error.message}`);
+    } else {
+      setCart([]);
+    }
   }, [cart]);
   
-  const updateOrderStatus = useCallback((orderId: string, status: OrderStatus, estimatedDeliveryTime?: string) => {
-    setOrders(prevOrders =>
-      prevOrders.map(order =>
-        order.id === orderId
-          ? { ...order, status, estimatedDeliveryTime: estimatedDeliveryTime !== undefined ? estimatedDeliveryTime : order.estimatedDeliveryTime }
-          : order
-      )
-    );
+  const updateOrderStatus = useCallback(async (orderId: string, status: OrderStatus) => {
+    if(!supabase) return;
+    const { error } = await supabase
+      .from('orders')
+      .update({ status: status, status_updated_at: new Date().toISOString() })
+      .eq('id', orderId);
+    if(error) {
+      console.error("Error updating order status:", error.message);
+      alert(`Failed to update status: ${error.message}`);
+    } else {
+       setOrders(prev => prev.map(o => o.id === orderId ? {...o, status: status} : o));
+    }
   }, []);
-
 
   const clearNotifications = useCallback(() => {
     setNotifications([]);
   }, []);
 
   const value = useMemo(() => ({
+    loading,
     foodItems,
     cart,
     orders,
@@ -146,9 +256,9 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     removeFromCart,
     clearCart,
     placeOrder,
-    clearNotifications,
     updateOrderStatus,
-  }), [foodItems, cart, orders, notifications, addFoodItem, addToCart, updateCartQuantity, removeFromCart, clearCart, placeOrder, clearNotifications, updateOrderStatus]);
+    clearNotifications,
+  }), [loading, foodItems, cart, orders, notifications, addFoodItem, addToCart, updateCartQuantity, removeFromCart, clearCart, placeOrder, updateOrderStatus, clearNotifications]);
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 };
@@ -157,82 +267,6 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 export const useAppContext = () => React.useContext(AppContext);
 
 // --- Components ---
-
-// Order Details Modal
-const OrderDetailsModal: React.FC<{ order: Order; onClose: () => void; isAdmin?: boolean }> = ({ order, onClose, isAdmin = false }) => {
-    const { updateOrderStatus } = useAppContext();
-    const [status, setStatus] = useState<OrderStatus>(order.status);
-    const [deliveryTime, setDeliveryTime] = useState(order.estimatedDeliveryTime || '');
-    
-    const handleUpdateStatus = () => {
-        updateOrderStatus(order.id, status, deliveryTime);
-        onClose();
-    };
-
-    return (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-            <div className="bg-white rounded-lg shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
-                <div className="p-6">
-                    <div className="flex justify-between items-center border-b pb-3">
-                        <h3 className="text-xl font-bold">Order Details</h3>
-                        <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
-                        </button>
-                    </div>
-                    <div className="mt-4 space-y-4">
-                        <div>
-                            <h4 className="font-semibold">Customer Information</h4>
-                            <p><strong>Name:</strong> {order.customer.name}</p>
-                            <p><strong>Phone:</strong> {order.customer.phone}</p>
-                            {order.customer.email && <p><strong>Email:</strong> {order.customer.email}</p>}
-                            <p><strong>Address:</strong> {order.customer.address}</p>
-                        </div>
-                        <div>
-                            <h4 className="font-semibold">Order Summary</h4>
-                            <p><strong>Status:</strong> <span className="font-medium text-blue-600">{order.status}</span></p>
-                            <p><strong>Payment Method:</strong> {order.paymentMethod}</p>
-                            <p><strong>Total:</strong> <span className="font-bold text-orange-600">₹{order.total.toFixed(2)}</span></p>
-                        </div>
-                        <div>
-                            <h4 className="font-semibold">Items Ordered</h4>
-                            <ul className="list-disc list-inside space-y-1 mt-2">
-                                {order.items.map(item => (
-                                    <li key={item.id}>{item.quantity} x {item.name}</li>
-                                ))}
-                            </ul>
-                        </div>
-                        {isAdmin && (
-                            <div className="mt-6 pt-4 border-t">
-                                <h4 className="font-semibold mb-2">Update Order Status</h4>
-                                <div className="space-y-3">
-                                    <select value={status} onChange={(e) => setStatus(e.target.value as OrderStatus)} className="w-full border p-2 rounded-md bg-white">
-                                        <option value="Pending">Pending</option>
-                                        <option value="Preparing">Preparing</option>
-                                        <option value="Packed">Packed</option>
-                                        <option value="Out for Delivery">Out for Delivery</option>
-                                        <option value="Delivered">Delivered</option>
-                                    </select>
-                                    {(status === 'Out for Delivery' || status === 'Delivered') && (
-                                        <input
-                                            type="text"
-                                            value={deliveryTime}
-                                            onChange={(e) => setDeliveryTime(e.target.value)}
-                                            placeholder="e.g., in 30 minutes"
-                                            className="w-full border p-2 rounded-md"
-                                        />
-                                    )}
-                                    <button onClick={handleUpdateStatus} className="w-full py-2 bg-green-500 text-white font-semibold rounded-lg hover:bg-green-600 transition-colors">
-                                        Update Status
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
-};
 
 // Header Component
 const Header: React.FC<{ setView: (view: View) => void }> = ({ setView }) => {
@@ -270,7 +304,7 @@ const Header: React.FC<{ setView: (view: View) => void }> = ({ setView }) => {
             </div>
             <div className="flex items-center space-x-4">
               <button onClick={() => setView('customer')} className="text-gray-600 hover:text-orange-600 px-3 py-2 rounded-md text-sm font-medium">Menu</button>
-              <button onClick={() => setView('myOrders')} className="text-gray-600 hover:text-orange-600 px-3 py-2 rounded-md text-sm font-medium">My Orders</button>
+              <button onClick={() => setView('my-orders')} className="text-gray-600 hover:text-orange-600 px-3 py-2 rounded-md text-sm font-medium">My Orders</button>
               <button onClick={() => setView('admin')} className="text-gray-600 hover:text-orange-600 px-3 py-2 rounded-md text-sm font-medium">Admin</button>
               <div className="relative">
                 <button onClick={handleNotificationClick} className="relative p-2 rounded-full text-gray-500 hover:text-orange-600 hover:bg-gray-100 focus:outline-none">
@@ -337,7 +371,7 @@ const FoodItemCard: React.FC<{ item: FoodItem }> = ({ item }) => {
         <img className="h-48 w-full object-cover cursor-pointer" src={item.image1Url} alt={item.name} onClick={() => setShowDetails(true)} />
         <div className="p-4">
           <h3 className="text-xl font-semibold text-gray-800 mb-1">{item.name}</h3>
-          <p className="text-gray-600 text-sm mb-2">{item.description}</p>
+          <p className="text-gray-600 text-sm mb-2 truncate">{item.description}</p>
           <div className="flex justify-between items-center mt-4">
             <span className="text-lg font-bold text-orange-600">₹{item.price}</span>
             <button
@@ -473,12 +507,12 @@ const CheckoutView: React.FC<{ setView: (view: View) => void }> = ({ setView }) 
     const [customer, setCustomer] = useState<CustomerDetails>({ name: '', phone: '', address: '' });
     const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('Cash on Delivery');
     
-    const handleSubmit = (e: React.FormEvent) => {
+    const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         if(customer.name && customer.phone && customer.address) {
-            placeOrder(customer, paymentMethod);
+            await placeOrder(customer, paymentMethod);
             alert('Order placed successfully!');
-            setView('myOrders');
+            setView('my-orders');
         } else {
             alert('Please fill all required fields.');
         }
@@ -529,43 +563,36 @@ const CheckoutView: React.FC<{ setView: (view: View) => void }> = ({ setView }) 
 
 // Admin View
 const AdminView: React.FC = () => {
-    const { orders, addFoodItem } = useAppContext();
-    const [newItem, setNewItem] = useState({ name: '', description: '', size: '', price: '', image1Url: '', image2Url: '', videoUrl: '' });
+    const { orders, addFoodItem, updateOrderStatus } = useAppContext();
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [newItem, setNewItem] = useState({ name: '', description: '', size: '', price: 0, image1File: null, image2File: null, videoFile: null });
     const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
-    const formRef = useRef<HTMLFormElement>(null);
 
-    const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
-        const { name, value } = e.target;
-        setNewItem(prev => ({
-            ...prev,
-            [name]: value
-        }));
-    };
-
-    const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, field: 'image1Url' | 'image2Url' | 'videoUrl') => {
+    const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>, field: 'image1File' | 'image2File' | 'videoFile') => {
         if (e.target.files && e.target.files[0]) {
             const file = e.target.files[0];
-            setNewItem(prev => ({ ...prev, [field]: URL.createObjectURL(file) }));
+            setNewItem(prev => ({ ...prev, [field]: file }));
         }
     };
+    
+    const handleStatusChange = (orderId: string, status: OrderStatus) => {
+        updateOrderStatus(orderId, status);
+    };
 
-    const handleSubmit = (e: React.FormEvent) => {
+    const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        const priceNumber = parseFloat(newItem.price);
-        if (newItem.name && newItem.description && newItem.size && !isNaN(priceNumber) && priceNumber > 0 && newItem.image1Url && newItem.image2Url) {
-            const itemToAdd = {
-                name: newItem.name,
-                description: newItem.description,
-                size: newItem.size,
-                price: priceNumber,
-                image1Url: newItem.image1Url,
-                image2Url: newItem.image2Url,
-                videoUrl: newItem.videoUrl,
-            };
-            addFoodItem(itemToAdd);
-            setNewItem({ name: '', description: '', size: '', price: '', image1Url: '', image2Url: '', videoUrl: '' });
-            formRef.current?.reset();
-            alert('Food item added successfully!');
+        if (newItem.name && newItem.description && newItem.size && newItem.price > 0 && newItem.image1File && newItem.image2File) {
+            setIsSubmitting(true);
+            try {
+                await addFoodItem(newItem);
+                setNewItem({ name: '', description: '', size: '', price: 0, image1File: null, image2File: null, videoFile: null });
+                (e.target as HTMLFormElement).reset();
+                alert('Food item added successfully!');
+            } catch (error) {
+                 alert('Failed to add food item. Please check the console for details.');
+            } finally {
+                setIsSubmitting(false);
+            }
         } else {
             alert('Please fill all required fields and upload two images.');
         }
@@ -575,106 +602,177 @@ const AdminView: React.FC = () => {
         <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-8 grid grid-cols-1 lg:grid-cols-5 gap-8">
             <div className="lg:col-span-2 bg-white p-6 rounded-lg shadow-md h-fit">
                 <h2 className="text-2xl font-bold mb-4">Add New Food Item</h2>
-                <form onSubmit={handleSubmit} className="space-y-4" ref={formRef}>
-                    <input type="text" name="name" placeholder="Name" value={newItem.name} onChange={handleInputChange} className="w-full border p-2 rounded-md" />
-                    <textarea name="description" placeholder="Description" value={newItem.description} onChange={handleInputChange} className="w-full border p-2 rounded-md" rows={3}></textarea>
-                    <input type="text" name="size" placeholder="Size (e.g., Medium)" value={newItem.size} onChange={handleInputChange} className="w-full border p-2 rounded-md" />
-                    <input type="number" name="price" placeholder="Price" value={newItem.price} onChange={handleInputChange} className="w-full border p-2 rounded-md" />
+                <form onSubmit={handleSubmit} className="space-y-4">
+                    <input type="text" placeholder="Name" onChange={e => setNewItem(prev => ({ ...prev, name: e.target.value }))} className="w-full border p-2 rounded-md" required/>
+                    <textarea placeholder="Description" onChange={e => setNewItem(prev => ({ ...prev, description: e.target.value }))} className="w-full border p-2 rounded-md" rows={3} required></textarea>
+                    <input type="text" placeholder="Size (e.g., Medium)" onChange={e => setNewItem(prev => ({ ...prev, size: e.target.value }))} className="w-full border p-2 rounded-md" required/>
+                    <input type="number" placeholder="Price" onChange={e => setNewItem(prev => ({ ...prev, price: parseFloat(e.target.value) }))} className="w-full border p-2 rounded-md" required/>
                     
                     <div>
-                        <label className="block text-sm font-medium text-gray-700">Image 1</label>
-                        <input type="file" accept="image/*" onChange={e => handleFileChange(e, 'image1Url')} className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-orange-50 file:text-orange-700 hover:file:bg-orange-100" />
+                        <label className="block text-sm font-medium text-gray-700">Image 1 *</label>
+                        <input type="file" accept="image/*" onChange={e => handleFileChange(e, 'image1File')} className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-orange-50 file:text-orange-700 hover:file:bg-orange-100" required/>
                     </div>
                      <div>
-                        <label className="block text-sm font-medium text-gray-700">Image 2</label>
-                        <input type="file" accept="image/*" onChange={e => handleFileChange(e, 'image2Url')} className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-orange-50 file:text-orange-700 hover:file:bg-orange-100" />
+                        <label className="block text-sm font-medium text-gray-700">Image 2 *</label>
+                        <input type="file" accept="image/*" onChange={e => handleFileChange(e, 'image2File')} className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-orange-50 file:text-orange-700 hover:file:bg-orange-100" required/>
                     </div>
                      <div>
-                        <label className="block text-sm font-medium text-gray-700">Video</label>
-                        <input type="file" accept="video/*" onChange={e => handleFileChange(e, 'videoUrl')} className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-orange-50 file:text-orange-700 hover:file:bg-orange-100" />
+                        <label className="block text-sm font-medium text-gray-700">Video (Optional)</label>
+                        <input type="file" accept="video/*" onChange={e => handleFileChange(e, 'videoFile')} className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-orange-50 file:text-orange-700 hover:file:bg-orange-100" />
                     </div>
                     
-                    <button type="submit" className="w-full py-2 bg-orange-500 text-white font-semibold rounded-lg hover:bg-orange-600 transition-colors">Add Item</button>
+                    <button type="submit" disabled={isSubmitting} className="w-full py-2 bg-orange-500 text-white font-semibold rounded-lg hover:bg-orange-600 transition-colors disabled:bg-orange-300">
+                        {isSubmitting ? 'Adding...' : 'Add Item'}
+                    </button>
                 </form>
             </div>
             <div className="lg:col-span-3 bg-white p-6 rounded-lg shadow-md">
                 <h2 className="text-2xl font-bold mb-4">All Orders</h2>
                 <div className="space-y-4 max-h-[70vh] overflow-y-auto">
                     {orders.length > 0 ? orders.map(order => (
-                        <div key={order.id} className="border p-4 rounded-md hover:bg-gray-50 cursor-pointer" onClick={() => setSelectedOrder(order)}>
-                            <div className="flex justify-between items-center">
+                        <div key={order.id} className="border p-4 rounded-md hover:bg-gray-50">
+                            <div className="flex justify-between items-start">
                                 <div>
-                                    <p className="font-semibold">{order.customer.name}</p>
-                                    <p className="text-sm text-gray-500">{order.timestamp.toLocaleString()}</p>
+                                    <p className="font-semibold cursor-pointer hover:text-orange-600" onClick={() => setSelectedOrder(order)}>{order.customer.name}</p>
+                                    <p className="text-sm text-gray-500">{new Date(order.timestamp).toLocaleString()}</p>
+                                    <p className="font-bold text-lg text-orange-600 mt-1">₹{order.total.toFixed(2)}</p>
                                 </div>
                                 <div className="text-right">
-                                    <p className="font-bold text-lg text-orange-600">₹{order.total.toFixed(2)}</p>
-                                    <p className="text-sm text-gray-500">{order.items.length} item(s) - <span className="font-medium text-blue-600">{order.status}</span></p>
+                                     <select 
+                                        value={order.status} 
+                                        onChange={(e) => handleStatusChange(order.id, e.target.value as OrderStatus)}
+                                        className="border-gray-300 rounded-md shadow-sm focus:border-orange-300 focus:ring focus:ring-orange-200 focus:ring-opacity-50"
+                                     >
+                                        {(['Pending', 'Preparing', 'Out for Delivery', 'Delivered', 'Cancelled'] as OrderStatus[]).map(status => (
+                                            <option key={status} value={status}>{status}</option>
+                                        ))}
+                                     </select>
                                 </div>
                             </div>
                         </div>
                     )) : <p>No orders yet.</p>}
                 </div>
             </div>
-            {selectedOrder && <OrderDetailsModal order={selectedOrder} onClose={() => setSelectedOrder(null)} isAdmin={true} />}
+            {selectedOrder && <OrderDetailsModal order={selectedOrder} onClose={() => setSelectedOrder(null)} />}
         </div>
     );
 };
 
-const OrderStatusTracker: React.FC<{ status: OrderStatus; deliveryTime?: string }> = ({ status, deliveryTime }) => {
-    const statuses: OrderStatus[] = ['Pending', 'Preparing', 'Packed', 'Out for Delivery', 'Delivered'];
-    const currentIndex = statuses.indexOf(status);
-
+// Order Details Modal
+const OrderDetailsModal: React.FC<{ order: Order; onClose: () => void }> = ({ order, onClose }) => {
     return (
-        <div className="w-full py-4">
-             <div className="flex items-center">
-                {statuses.map((s, index) => (
-                    <React.Fragment key={s}>
-                        <div className="flex flex-col items-center">
-                            <div className={`w-8 h-8 rounded-full flex items-center justify-center text-white ${index <= currentIndex ? 'bg-green-500' : 'bg-gray-300'}`}>
-                                {index < currentIndex ? '✓' : index + 1}
-                            </div>
-                            <p className={`mt-2 text-xs text-center ${index <= currentIndex ? 'font-semibold' : ''}`}>{s}</p>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-lg shadow-xl max-w-lg w-full max-h-[90vh] overflow-y-auto">
+                <div className="p-6">
+                    <div className="flex justify-between items-center border-b pb-3">
+                        <h3 className="text-xl font-bold">Order Details</h3>
+                        <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                        </button>
+                    </div>
+                    <div className="mt-4 space-y-4">
+                         <div>
+                            <h4 className="font-semibold mb-2">Order Status</h4>
+                            <OrderStatusTracker currentStatus={order.status} />
                         </div>
-                        {index < statuses.length - 1 && <div className={`flex-auto border-t-2 ${index < currentIndex ? 'border-green-500' : 'border-gray-300'}`}></div>}
-                    </React.Fragment>
-                ))}
+                        <div>
+                            <h4 className="font-semibold">Customer Information</h4>
+                            <p><strong>Name:</strong> {order.customer.name}</p>
+                            <p><strong>Phone:</strong> {order.customer.phone}</p>
+                            {order.customer.email && <p><strong>Email:</strong> {order.customer.email}</p>}
+                            <p><strong>Address:</strong> {order.customer.address}</p>
+                        </div>
+                        <div>
+                            <h4 className="font-semibold">Order Summary</h4>
+                            <p><strong>Payment Method:</strong> {order.paymentMethod}</p>
+                            <p><strong>Total:</strong> <span className="font-bold text-orange-600">₹{order.total.toFixed(2)}</span></p>
+                        </div>
+                        <div>
+                            <h4 className="font-semibold">Items Ordered</h4>
+                            <ul className="list-disc list-inside space-y-1 mt-2">
+                                {order.items.map(item => (
+                                    <li key={item.id}>{item.quantity} x {item.name}</li>
+                                ))}
+                            </ul>
+                        </div>
+                    </div>
+                </div>
             </div>
-            {status === 'Out for Delivery' && deliveryTime && (
-                <p className="text-center mt-4 text-sm font-medium text-orange-600">Estimated Delivery: {deliveryTime}</p>
-            )}
         </div>
     );
 };
 
-const CustomerOrdersView: React.FC<{ setView: (view: View) => void }> = ({ setView }) => {
+const OrderStatusTracker: React.FC<{ currentStatus: OrderStatus }> = ({ currentStatus }) => {
+    const statuses: OrderStatus[] = ['Pending', 'Preparing', 'Out for Delivery', 'Delivered'];
+    const currentIndex = statuses.indexOf(currentStatus);
+
+    if(currentStatus === 'Cancelled') {
+        return (
+            <div className="flex items-center justify-center p-4 bg-red-100 border-l-4 border-red-500 text-red-700 rounded-md">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                <p className="font-semibold">This order has been cancelled.</p>
+            </div>
+        );
+    }
+    
+    return (
+        <div className="flex items-center justify-between">
+            {statuses.map((status, index) => (
+                <React.Fragment key={status}>
+                    <div className="flex flex-col items-center text-center">
+                        <div className={`w-8 h-8 rounded-full flex items-center justify-center ${index <= currentIndex ? 'bg-orange-500 text-white' : 'bg-gray-200 text-gray-500'}`}>
+                           {index < currentIndex ? '✓' : index + 1}
+                        </div>
+                        <p className={`text-xs mt-1 ${index <= currentIndex ? 'font-semibold text-gray-800' : 'text-gray-500'}`}>{status}</p>
+                    </div>
+                    {index < statuses.length - 1 && (
+                        <div className={`flex-1 h-1 mx-2 ${index < currentIndex ? 'bg-orange-500' : 'bg-gray-200'}`}></div>
+                    )}
+                </React.Fragment>
+            ))}
+        </div>
+    );
+};
+
+// My Orders View (New Component)
+const MyOrdersView: React.FC<{setView: (view: View) => void}> = ({setView}) => {
     const { orders } = useAppContext();
 
     return (
         <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-8">
             <h1 className="text-3xl font-bold text-gray-800 mb-6">My Orders</h1>
             {orders.length === 0 ? (
-                <p className="text-gray-600">You haven't placed any orders yet. <span className="text-orange-500 cursor-pointer hover:underline" onClick={() => setView('customer')}>Start ordering!</span></p>
+                <p className="text-gray-600">You haven't placed any orders yet. <span className="text-orange-500 cursor-pointer hover:underline" onClick={()=> setView('customer')}>Start ordering!</span></p>
             ) : (
                 <div className="space-y-6">
                     {orders.map(order => (
                         <div key={order.id} className="bg-white p-6 rounded-lg shadow-md">
-                            <div className="flex justify-between items-start mb-4">
+                            <div className="flex flex-col sm:flex-row justify-between sm:items-center border-b pb-4 mb-4">
                                 <div>
-                                    <h2 className="font-bold text-lg">Order #{order.id.split('-')[1]}</h2>
-                                    <p className="text-sm text-gray-500">Placed on: {order.timestamp.toLocaleString()}</p>
+                                    <p className="text-sm text-gray-500">Order ID: {order.id.substring(0,8)}...</p>
+                                    <p className="text-sm text-gray-500">Placed on: {new Date(order.timestamp).toLocaleString()}</p>
                                 </div>
-                                <p className="font-bold text-xl text-orange-600">₹{order.total.toFixed(2)}</p>
+                                <p className="font-bold text-xl text-orange-600 mt-2 sm:mt-0">₹{order.total.toFixed(2)}</p>
                             </div>
-                            <OrderStatusTracker status={order.status} deliveryTime={order.estimatedDeliveryTime} />
-                             <div className="mt-4 border-t pt-4">
-                                <h3 className="font-semibold">Items:</h3>
-                                <ul className="list-disc list-inside text-gray-600">
-                                {order.items.map(item => (
-                                    <li key={item.id}>{item.quantity} x {item.name}</li>
+                            <div className="mb-4">
+                                <h4 className="font-semibold mb-3">Items</h4>
+                                <div className="flex space-x-2">
+                                {order.items.slice(0, 5).map(item => (
+                                     <div key={item.id} className="relative group">
+                                        <img src={item.image1Url} alt={item.name} className="w-12 h-12 object-cover rounded-md"/>
+                                        <div className="absolute bottom-full mb-2 hidden group-hover:block w-max bg-gray-800 text-white text-xs rounded py-1 px-2">
+                                            {item.quantity} x {item.name}
+                                        </div>
+                                    </div>
                                 ))}
-                                </ul>
+                                {order.items.length > 5 && (
+                                    <div className="w-12 h-12 rounded-md bg-gray-200 flex items-center justify-center text-sm font-semibold">
+                                        +{order.items.length - 5}
+                                    </div>
+                                )}
+                                </div>
                             </div>
+                            <OrderStatusTracker currentStatus={order.status} />
                         </div>
                     ))}
                 </div>
@@ -683,10 +781,37 @@ const CustomerOrdersView: React.FC<{ setView: (view: View) => void }> = ({ setVi
     );
 };
 
+
+type View = 'customer' | 'cart' | 'checkout' | 'admin' | 'my-orders';
+
 function App() {
   const [view, setView] = useState<View>('customer');
 
-  const renderView = () => {
+  if (!supabase) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-100 p-4">
+        <div className="p-8 bg-white rounded-lg shadow-xl text-center max-w-lg w-full">
+          <h1 className="text-2xl font-bold text-red-600 mb-4">Configuration Error</h1>
+          <p className="text-gray-700 mb-3">
+            Supabase is not configured correctly. The application cannot connect to the database.
+          </p>
+          <p className="text-gray-700 mb-6">
+            Please open the file <code className="bg-gray-200 text-gray-800 p-1 rounded font-mono text-sm">supabaseClient.ts</code> and replace the placeholder values for <code className="bg-gray-200 text-gray-800 p-1 rounded font-mono text-sm">supabaseUrl</code> and <code className="bg-gray-200 text-gray-800 p-1 rounded font-mono text-sm">supabaseAnonKey</code> with your actual Supabase project credentials.
+          </p>
+          <div className="bg-orange-50 border-l-4 border-orange-400 text-orange-700 p-4 text-left" role="alert">
+            <p className="font-bold">Important (महत्वपूर्ण)</p>
+            <p>You can find this information in your Supabase project's "Settings" &gt; "API" section.</p>
+            <p>आपको यह जानकारी आपके Supabase प्रोजेक्ट की सेटिंग्स के "API" सेक्शन में मिलेगी।</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const renderView = (loading: boolean) => {
+    if (loading) {
+        return <div className="flex justify-center items-center h-64"><p className="text-xl text-gray-500">Loading data...</p></div>;
+    }
     switch(view) {
       case 'cart':
         return <CartView setView={setView} />;
@@ -694,8 +819,8 @@ function App() {
         return <CheckoutView setView={setView} />;
       case 'admin':
         return <AdminView />;
-      case 'myOrders':
-        return <CustomerOrdersView setView={setView} />;
+      case 'my-orders':
+        return <MyOrdersView setView={setView}/>;
       case 'customer':
       default:
         return <CustomerView />;
@@ -704,12 +829,16 @@ function App() {
 
   return (
     <AppProvider>
-      <div className="min-h-screen bg-gray-50">
-        <Header setView={setView} />
-        <main>
-          {renderView()}
-        </main>
-      </div>
+      <AppContext.Consumer>
+        {({ loading }) => (
+          <div className="min-h-screen bg-gray-50">
+            <Header setView={setView} />
+            <main>
+              {renderView(loading)}
+            </main>
+          </div>
+        )}
+      </AppContext.Consumer>
     </AppProvider>
   );
 }
